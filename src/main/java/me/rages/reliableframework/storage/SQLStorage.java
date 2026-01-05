@@ -12,6 +12,7 @@ import java.lang.reflect.Field;
 import java.sql.*;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -24,6 +25,12 @@ public abstract class SQLStorage implements Database {
     protected final JavaPlugin plugin;
     protected Connection connection;
     protected Class<? extends DataObject>[] dataObjectClasses;
+
+    /**
+     * Cache of known columns per table to avoid repeated database queries.
+     * Key: table name, Value: set of column names known to exist.
+     */
+    protected final Map<String, Set<String>> columnCache = new ConcurrentHashMap<>();
 
     /**
      * Constructs an SQLStorage instance.
@@ -291,6 +298,7 @@ public abstract class SQLStorage implements Database {
 
     /**
      * Ensures a column exists in a table. If it doesn't, it adds the column.
+     * Uses an in-memory cache to avoid repeated database queries.
      *
      * @param tableName  the name of the table
      * @param columnName the name of the column
@@ -298,10 +306,20 @@ public abstract class SQLStorage implements Database {
      * @throws SQLException if a database access error occurs
      */
     public void ensureColumnExists(String tableName, String columnName, Object value) throws SQLException {
+        // Check cache first - avoids database query if column is known
+        Set<String> knownColumns = columnCache.computeIfAbsent(tableName, k -> ConcurrentHashMap.newKeySet());
+        if (knownColumns.contains(columnName.toLowerCase())) {
+            return;
+        }
+
+        // Column not in cache, check database
         if (!columnExists(tableName, columnName)) {
             String columnType = getColumnType(value.getClass());
             addColumn(tableName, columnName + " " + columnType);
         }
+
+        // Add to cache after confirming it exists (either already existed or we just created it)
+        knownColumns.add(columnName.toLowerCase());
     }
 
     /**
@@ -323,20 +341,35 @@ public abstract class SQLStorage implements Database {
             try (ResultSet rs = query(sql, entry.getValue())) {
                 if (rs.next()) {
                     T dataObject = createDataObjectInstance(clazz);
+
+                    // Cache field mappings and collect annotated column names
+                    Set<String> annotatedColumns = new HashSet<>();
                     for (Field field : clazz.getDeclaredFields()) {
                         if (field.isAnnotationPresent(Column.class)) {
                             Column column = field.getAnnotation(Column.class);
+                            annotatedColumns.add(column.name().toLowerCase());
                             Object value = rs.getObject(column.name());
                             if (field.getType() == UUID.class && value instanceof String) {
                                 value = UUID.fromString((String) value);
-                            } else if (field.getType() == Boolean.class) {
+                            } else if (field.getType() == Boolean.class && value instanceof Integer) {
                                 value = (Integer) value != 0;
+                            } else if (field.getType() == Long.class && value instanceof Integer) {
+                                value = ((Integer) value).longValue();
                             }
                             field.setAccessible(true);
                             field.set(dataObject, value);
                         }
                     }
-                    fillDataObjectFromResultSet(dataObject, rs);
+
+                    // Get column names from metadata
+                    ResultSetMetaData metaData = rs.getMetaData();
+                    int columnCount = metaData.getColumnCount();
+                    List<String> resultColumnNames = new ArrayList<>(columnCount);
+                    for (int i = 1; i <= columnCount; i++) {
+                        resultColumnNames.add(metaData.getColumnName(i));
+                    }
+
+                    fillDataObjectFromResultSet(dataObject, rs, resultColumnNames, annotatedColumns);
                     return dataObject;
                 }
             } catch (SQLException | ReflectiveOperationException e) {
@@ -360,31 +393,58 @@ public abstract class SQLStorage implements Database {
             String tableName = getTableName(clazz);
             String sql = "SELECT * FROM " + tableName;
             try (ResultSet rs = query(sql)) {
+                // Cache field metadata once for the entire result set (not per row)
+                Field[] fields = clazz.getDeclaredFields();
+                Set<String> annotatedColumns = new HashSet<>();
+                List<ColumnFieldMapping> columnMappings = new ArrayList<>();
+
+                for (Field field : fields) {
+                    if (field.isAnnotationPresent(Column.class)) {
+                        Column column = field.getAnnotation(Column.class);
+                        field.setAccessible(true);
+                        annotatedColumns.add(column.name().toLowerCase());
+                        columnMappings.add(new ColumnFieldMapping(field, column.name()));
+                    }
+                }
+
+                // Cache ResultSet metadata once (not per row)
+                List<String> resultColumnNames = null;
+
                 while (rs.next()) {
-                    T dataObject = createDataObjectInstance(clazz);
-                    for (Field field : clazz.getDeclaredFields()) {
-                        if (field.isAnnotationPresent(Column.class)) {
-                            Column column = field.getAnnotation(Column.class);
-                            Object value = rs.getObject(column.name());
-
-                            // Handle UUID conversion
-                            if (field.getType() == UUID.class && value instanceof String) {
-                                value = UUID.fromString((String) value);
-                            }
-                            // Handle Boolean conversion
-                            else if (field.getType() == Boolean.class && value instanceof Integer) {
-                                value = (Integer) value != 0;
-                            }
-                            // Handle Long conversion
-                            else if (field.getType() == Long.class && value instanceof Integer) {
-                                value = ((Integer) value).longValue();
-                            }
-
-                            field.setAccessible(true);
-                            field.set(dataObject, value);
+                    // Fetch metadata on first row only
+                    if (resultColumnNames == null) {
+                        ResultSetMetaData metaData = rs.getMetaData();
+                        int columnCount = metaData.getColumnCount();
+                        resultColumnNames = new ArrayList<>(columnCount);
+                        for (int i = 1; i <= columnCount; i++) {
+                            resultColumnNames.add(metaData.getColumnName(i));
                         }
                     }
-                    fillDataObjectFromResultSet(dataObject, rs);
+
+                    T dataObject = createDataObjectInstance(clazz);
+
+                    // Set @Column annotated fields using cached mappings
+                    for (ColumnFieldMapping mapping : columnMappings) {
+                        Object value = rs.getObject(mapping.columnName);
+
+                        // Handle UUID conversion
+                        if (mapping.field.getType() == UUID.class && value instanceof String) {
+                            value = UUID.fromString((String) value);
+                        }
+                        // Handle Boolean conversion
+                        else if (mapping.field.getType() == Boolean.class && value instanceof Integer) {
+                            value = (Integer) value != 0;
+                        }
+                        // Handle Long conversion
+                        else if (mapping.field.getType() == Long.class && value instanceof Integer) {
+                            value = ((Integer) value).longValue();
+                        }
+
+                        mapping.field.set(dataObject, value);
+                    }
+
+                    // Fill dynamic columns, skipping already-processed @Column fields
+                    fillDataObjectFromResultSet(dataObject, rs, resultColumnNames, annotatedColumns);
                     dataObjects.add(dataObject);
                 }
             } catch (SQLException | ReflectiveOperationException e) {
@@ -392,6 +452,19 @@ public abstract class SQLStorage implements Database {
             }
             return dataObjects;
         });
+    }
+
+    /**
+     * Helper class to cache field-to-column mappings, avoiding repeated reflection.
+     */
+    private static class ColumnFieldMapping {
+        final Field field;
+        final String columnName;
+
+        ColumnFieldMapping(Field field, String columnName) {
+            this.field = field;
+            this.columnName = columnName;
+        }
     }
 
     /**
@@ -458,17 +531,22 @@ public abstract class SQLStorage implements Database {
     }
 
     /**
-     * Fills a data object with data from a result set.
+     * Fills a data object with dynamic (non-@Column) data from a result set.
+     * Uses pre-fetched metadata and column names to avoid redundant allocations.
      *
-     * @param dataObject the data object to fill
-     * @param rs         the result set
+     * @param dataObject       the data object to fill
+     * @param rs               the result set
+     * @param columnNames      pre-fetched list of column names from metadata
+     * @param annotatedColumns set of column names already handled by @Column annotations (to skip)
      * @throws SQLException if a database access error occurs
      */
-    private void fillDataObjectFromResultSet(DataObject dataObject, ResultSet rs) throws SQLException {
-        ResultSetMetaData metaData = rs.getMetaData();
-        int columnCount = metaData.getColumnCount();
-        for (int i = 1; i <= columnCount; i++) {
-            String columnName = metaData.getColumnName(i);
+    private void fillDataObjectFromResultSet(DataObject dataObject, ResultSet rs,
+                                             List<String> columnNames, Set<String> annotatedColumns) throws SQLException {
+        for (String columnName : columnNames) {
+            // Skip columns already set via @Column annotation to avoid double-processing
+            if (annotatedColumns.contains(columnName.toLowerCase())) {
+                continue;
+            }
             dataObject.set(columnName, rs.getObject(columnName));
         }
     }
@@ -551,6 +629,8 @@ public abstract class SQLStorage implements Database {
         for (Class<? extends DataObject> dataObjectClass : dataObjectClasses) {
             String tableName = getTableName(dataObjectClass);
             Map<String, String> columns = new LinkedHashMap<>();
+            Set<String> knownColumns = columnCache.computeIfAbsent(tableName, k -> ConcurrentHashMap.newKeySet());
+
             for (Field field : dataObjectClass.getDeclaredFields()) {
                 if (field.isAnnotationPresent(Column.class)) {
                     Column column = field.getAnnotation(Column.class);
@@ -561,6 +641,8 @@ public abstract class SQLStorage implements Database {
                     } else {
                         columns.put(column.name(), getColumnType(field.getType()));
                     }
+                    // Pre-populate cache with known columns from @Column annotations
+                    knownColumns.add(column.name().toLowerCase());
                 }
             }
             createTable(tableName, columns);
